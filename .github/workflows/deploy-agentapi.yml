@@ -1,0 +1,100 @@
+name: deploy-agentapi
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      enable_agentapi:
+        description: "Ensure agentapi service is enabled"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      deployment_repository:
+        description: "Repo containing CloudFormation templates"
+        required: false
+        default: "ai-teams-platform/ai-teams-deployment"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout agentapi repo
+        uses: actions/checkout@v4
+
+      - name: Checkout deployment repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.deployment_repository }}
+          path: deployment-repo
+
+      - name: Resolve template path
+        id: templates
+        run: |
+          if [ -f deployment-repo/cloudformation/ecr.yml ]; then
+            root="deployment-repo/cloudformation"
+          else
+            root="deployment-repo/ai-teams-deployment/cloudformation"
+          fi
+          echo "root=${root}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Ensure ECR repositories
+        run: |
+          aws cloudformation deploy \
+            --stack-name ai-teams-${{ inputs.environment }}-ecr \
+            --template-file ${{ steps.templates.outputs.root }}/ecr.yml \
+            --parameter-overrides EnvName=${{ inputs.environment }}
+
+      - name: Fetch ECR repository URI
+        id: ecr
+        run: |
+          agentapi_uri=$(aws cloudformation describe-stacks \
+            --stack-name ai-teams-${{ inputs.environment }}-ecr \
+            --query "Stacks[0].Outputs[?OutputKey=='AgentApiRepositoryUri'].OutputValue" \
+            --output text)
+          echo "agentapi_uri=${agentapi_uri}" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push agentapi image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          AGENTAPI_REPO: ${{ steps.ecr.outputs.agentapi_uri }}
+        run: |
+          docker build -t ${AGENTAPI_REPO}:${IMAGE_TAG} -f Dockerfile .
+          docker push ${AGENTAPI_REPO}:${IMAGE_TAG}
+
+      - name: Update ECS stack (agentapi image)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          AGENTAPI_REPO: ${{ steps.ecr.outputs.agentapi_uri }}
+        run: |
+          aws cloudformation deploy \
+            --stack-name ai-teams-${{ inputs.environment }}-ecs \
+            --template-file ${{ steps.templates.outputs.root }}/ecs.yml \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              EnvName=${{ inputs.environment }} \
+              AgentApiImageUri=${AGENTAPI_REPO}:${IMAGE_TAG} \
+              EnableAgentApi=${{ inputs.enable_agentapi }} \
+              AgentApiKey=${{ secrets.AGENT_API_KEY }}

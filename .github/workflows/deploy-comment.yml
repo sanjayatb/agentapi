@@ -1,0 +1,56 @@
+name: deploy-from-comment
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  dispatch:
+    if: ${{ github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      pull-requests: read
+      contents: read
+
+    steps:
+      - name: Parse deploy command
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = (context.payload.comment.body || '').trim().toLowerCase();
+            if (!body.startsWith('deploy ')) {
+              core.setOutput('matched', 'false');
+              return;
+            }
+            const env = body.replace('deploy ', '').trim();
+            if (!['dev', 'prod'].includes(env)) {
+              core.setOutput('matched', 'false');
+              return;
+            }
+            core.setOutput('matched', 'true');
+            core.setOutput('environment', env);
+
+      - name: Dispatch workflow
+        if: steps.parse.outputs.matched == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const environment = '${{ steps.parse.outputs.environment }}';
+            const issueNumber = context.issue.number;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: issueNumber,
+            });
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy-agentapi.yml',
+              ref: pr.head.ref,
+              inputs: {
+                environment,
+                enable_agentapi: 'true',
+              },
+            });
